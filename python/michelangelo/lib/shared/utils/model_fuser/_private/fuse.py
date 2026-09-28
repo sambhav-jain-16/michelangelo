@@ -67,6 +67,35 @@ def _schema_output_keys(schema: ModelSchema | None) -> list[str]:
     return [item.name for item in schema.output_schema]
 
 
+def _schema_input_shapes(schema: ModelSchema | None) -> dict[str, list[int]]:
+    """Return each input feature's declared shape (excluding batch), by name.
+
+    A feature whose ``shape`` is ``None`` (genuinely unspecified) is omitted
+    -- callers (``FusedModel._reshape_for_predictor``) should leave such a
+    feature unreshaped rather than guess. This deliberately differs from
+    ``_build_fused_sample_input``, which defaults an unspecified shape to a
+    single dimension of size 1 instead of omitting it -- that function must
+    still produce a concrete zero-filled tensor for tracing, while reshaping
+    an already-real value based on a guessed shape could silently corrupt
+    data the schema never actually described. Keep both in sync if either's
+    ``None``-handling changes.
+
+    Args:
+        schema: A model's input/output schema, or ``None``.
+
+    Returns:
+        Mapping of feature name to its declared shape. Empty if ``schema``
+        is ``None``.
+    """
+    if schema is None:
+        return {}
+    return {
+        item.name: list(item.shape)
+        for item in schema.input_schema
+        if item.shape is not None
+    }
+
+
 def _build_fused_sample_input(
     tx_model_schema: ModelSchema | None,
     model_schema: ModelSchema | None,
@@ -87,6 +116,14 @@ def _build_fused_sample_input(
     Returns:
         Mapping of fused input feature name to a zero-filled sample tensor.
         Empty if the fused input schema is empty.
+
+    Note:
+        Defaults an unspecified (``None``) shape to a single dimension of
+        size 1, unlike ``_schema_input_shapes`` (used by
+        ``FusedModel._reshape_for_predictor``), which omits such a feature
+        instead -- see that function's docstring for why the two
+        deliberately disagree. Keep both in sync if either's ``None``
+        handling changes.
     """
     input_items = fuse_input_schema(tx_model_schema, model_schema)
     if not input_items:
@@ -94,7 +131,13 @@ def _build_fused_sample_input(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sample: dict[str, torch.Tensor] = {}
     for item in input_items:
-        feature_shape = list(item.shape) if item.shape else [1]
+        # `shape=[]` (as opposed to `shape=None`) is a deliberate, documented
+        # convention for a true scalar column with no feature dimension at
+        # all (see `ColumnConfig.shape`'s docstring: "the common tabular
+        # case") -- it must produce a `[batch_size]` sample tensor, not
+        # `[batch_size, 1]`. Only a genuinely unset (`None`) shape falls back
+        # to a single dimension of size 1.
+        feature_shape = [1] if item.shape is None else list(item.shape)
         data_type = item.data_type if item.data_type is not None else DataType.UNKNOWN
         shape = [batch_size] + [max(1, int(s)) for s in feature_shape]
         dtype = data_type_to_torch_dtype(data_type)
@@ -253,6 +296,7 @@ def _build_fused_model_and_sample(
         transform_input_keys=transform_input_keys,
         predictor_input_keys=predictor_input_keys,
         predictor_takes_dict=predictor_takes_dict,
+        predictor_input_shapes=_schema_input_shapes(model_schema),
     )
     fused.eval()
 
@@ -269,27 +313,83 @@ def _build_fused_model_and_sample(
     return fused, sample_input, input_key_order
 
 
-def _build_tx_hydra_spec(tx_hyperparameters: dict[str, Any]) -> dict[str, Any]:
-    """Build a Hydra reconstruction spec for a fused native-transform layer stack.
+_TORCH_TRANSFORM_MODULE_CLASS = (
+    "michelangelo.lib.native_transform.torch.base_transform_module.TorchTransformModule"
+)
+_LOAD_TRANSFORM_MODULE_FACTORY = (
+    "michelangelo.lib.native_transform.torch.base_transform_module."
+    "load_transform_module_from_spec_dict"
+)
 
-    Not yet implemented in OSS michelangelo: reconstructing a native-transform
-    module/layer stack from a stored transform specification dict requires
-    the native-transform package, which has not been migrated. This blocks
-    only the Python-backend *raw* package for a native-transform-fused model
-    (:func:`~michelangelo.lib.shared.utils.model_fuser.fuse.fuse_models_to_python`);
-    the plain (no native-transform) path and the TorchScript/ONNX fused
-    deployable paths do not call this function.
+
+def _is_torch_transform_module(tx_model_class: str) -> bool:
+    """Return whether ``tx_model_class`` is ``TorchTransformModule`` or a subclass.
+
+    Checked via ``issubclass`` on the resolved class, not string equality
+    against ``_TORCH_TRANSFORM_MODULE_CLASS`` alone, so a downstream
+    subclass of ``TorchTransformModule`` also dispatches to
+    ``load_transform_module_from_spec_dict`` instead of silently falling
+    through to the generic branch (which would build a reconstruction spec
+    from its constructor kwargs -- wrong for any ``TorchTransformModule``
+    descendant, whose serialized hyperparameters are spec-DAG shaped).
+    Resolution happens lazily here (not a module-level import) so
+    ``model_fuser`` stays decoupled from ``native_transform`` for callers
+    that never fuse a native-transform model.
 
     Args:
-        tx_hyperparameters: The transform model's serialized hyperparameters
-            dict (the shape a future native-transform package's own
-            ``to_dict()`` would produce).
+        tx_model_class: Dotted class name of the fused transform model.
 
-    Raises:
-        NotImplementedError: Always, until native-transform support lands.
+    Returns:
+        ``True`` if ``tx_model_class`` names ``TorchTransformModule`` or a
+        subclass; ``False`` for anything else, including a class that fails
+        to import.
     """
-    raise NotImplementedError(
-        "Building a Hydra reconstruction spec for a fused native-transform "
-        "model requires the native-transform package, which is not yet "
-        "available in OSS michelangelo."
-    )
+    if tx_model_class == _TORCH_TRANSFORM_MODULE_CLASS:
+        return True
+    try:
+        resolved = import_attribute(tx_model_class)
+        base = import_attribute(_TORCH_TRANSFORM_MODULE_CLASS)
+    except (ImportError, AttributeError, ValueError):
+        return False
+    return isinstance(resolved, type) and issubclass(resolved, base)
+
+
+def _build_tx_hydra_spec(
+    tx_model_class: str, tx_hyperparameters: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a Hydra reconstruction spec for a fused native-transform layer stack.
+
+    For the real native-transform case (``tx_model_class`` is
+    ``TorchTransformModule`` or a subclass), ``tx_hyperparameters`` is a
+    ``TransformSpec.to_dict()``-shaped dict, not constructor kwargs, so it
+    can't be passed through as ``{"_target_": tx_model_class,
+    **tx_hyperparameters}`` directly. Dispatches instead to
+    ``load_transform_module_from_spec_dict``, a factory function that
+    rebuilds the ``TransformSpec`` and materializes it. Hydra's generic
+    ``instantiate`` resolves ``_target_`` against any importable callable,
+    not just a class constructor, so this works the same way a class
+    ``_target_`` does.
+
+    For any other ``tx_model_class`` (e.g. a hand-written custom transform
+    whose constructor kwargs match its own serialized hyperparameters),
+    falls back to the generic ``{"_target_": tx_model_class,
+    **tx_hyperparameters}`` spec -- the same shape used for
+    ``predictor_module``'s reconstruction spec. This two-way dispatch is a
+    deliberate, minimal starting point (one hardcoded special case, checked
+    structurally) rather than a general registry: introduce a registry only
+    if a second class needs its own bespoke reconstruction.
+
+    Args:
+        tx_model_class: Dotted class name of the fused transform model
+            (``native_transform_model.metadata.model_class``).
+        tx_hyperparameters: The transform model's serialized hyperparameters.
+
+    Returns:
+        A Hydra-style reconstruction spec dict with a ``_target_`` key.
+    """
+    if _is_torch_transform_module(tx_model_class):
+        return {
+            "_target_": _LOAD_TRANSFORM_MODULE_FACTORY,
+            "spec_dict": tx_hyperparameters,
+        }
+    return {"_target_": tx_model_class, **tx_hyperparameters}

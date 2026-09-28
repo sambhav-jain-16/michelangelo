@@ -1,8 +1,10 @@
 """Tests for :mod:`michelangelo.lib.native_transform.torch.base_transform_module`.
 
 Covers ``TorchTransformModule``'s DAG execution (including its
-TorchScript-round-trip contract) and ``get_transform_module``'s level-range
-materialization from a ``TransformSpec``.
+TorchScript-round-trip contract), ``get_transform_module``'s level-range
+materialization from a ``TransformSpec``, and
+``load_transform_module_from_spec_dict``'s reconstruction of a
+``TorchTransformModule`` from a ``TransformSpec.to_dict()`` dict.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from michelangelo.lib.native_transform.torch.base_layers import (  # noqa: E402
 from michelangelo.lib.native_transform.torch.base_transform_module import (  # noqa: E402
     TorchTransformModule,
     get_transform_module,
+    load_transform_module_from_spec_dict,
 )
 from michelangelo.lib.native_transform.torch.transform_spec import (  # noqa: E402
     TransformSpec,
@@ -252,3 +255,63 @@ class TestGetTransformModule:
         module.eval()
         result = module({"a": torch.tensor([1, 2, 3], dtype=torch.int32)})
         torch.testing.assert_close(result["a_scaled"], torch.tensor([2.0, 4.0, 6.0]))
+
+
+class TestLoadTransformModuleFromSpecDict:
+    """Reconstruction of a ``TorchTransformModule`` from ``TransformSpec.to_dict()``."""
+
+    def _spec(self) -> TransformSpec:
+        """Build the same two-level Cast -> Scale spec as ``TestGetTransformModule``."""
+        return TransformSpec(
+            raw_transform_specs={
+                "transform_specs": [
+                    {
+                        "transform_name": "Cast",
+                        "input_cols": ["a"],
+                        "output_cols": ["a_cast"],
+                        "dtype": "float32",
+                    },
+                    {
+                        "transform_name": "Scale",
+                        "input_cols": ["a_cast"],
+                        "output_cols": ["a_scaled"],
+                        "factor": 2.0,
+                    },
+                ]
+            }
+        )
+
+    def test_round_trips_through_to_dict_and_matches_get_transform_module(
+        self,
+    ) -> None:
+        """to_dict() -> load_transform_module_from_spec_dict reproduces the module."""
+        spec_dict = self._spec().to_dict()
+        expected = get_transform_module(self._spec(), start_level=0)
+
+        module = load_transform_module_from_spec_dict(spec_dict)
+
+        assert module.input_cols == expected.input_cols
+        assert module.output_cols == expected.output_cols
+        assert len(module.layers) == len(expected.layers)
+
+        module.eval()
+        expected.eval()
+        sample = {"a": torch.tensor([1, 2, 3], dtype=torch.int32)}
+        result = module(sample)
+        expected_result = expected(sample)
+        torch.testing.assert_close(result["a_scaled"], expected_result["a_scaled"])
+
+    def test_raises_when_spec_dict_has_zero_layers(self) -> None:
+        """Raises a clear error instead of returning None for an empty spec."""
+        spec_dict = TransformSpec(raw_transform_specs={"transform_specs": []}).to_dict()
+        with pytest.raises(ValueError, match="No transform layers"):
+            load_transform_module_from_spec_dict(spec_dict)
+
+    def test_respects_start_and_end_level(self) -> None:
+        """start_level/end_level narrow materialization, like get_transform_module."""
+        spec_dict = self._spec().to_dict()
+        module = load_transform_module_from_spec_dict(
+            spec_dict, start_level=0, end_level=0
+        )
+        assert len(module.layers) == 1
+        assert module.output_cols == ["a_cast"]

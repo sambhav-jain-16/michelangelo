@@ -5,22 +5,29 @@ Converts a fitted
 into a single ``torch.nn.Module`` that runs its layers in topological order.
 The module is TorchScript-exportable, so the exact same transform graph runs
 at training time (batched, ahead of the model) and at serving time (embedded
-in the model artifact).
+in the model artifact). ``load_transform_module_from_spec_dict`` reverses the
+serialization side of that same round trip, rebuilding a ``TransformSpec``
+(and materializing its ``TorchTransformModule``) from a
+``TransformSpec.to_dict()`` dict -- used as a fused model's Hydra
+reconstruction factory (see
+:mod:`michelangelo.lib.shared.utils.model_fuser._private.fuse`).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 
 from michelangelo.lib.native_transform.torch.base_layers import TorchTransformBaseLayer
+from michelangelo.lib.native_transform.torch.transform_spec import TransformSpec
 from michelangelo.lib.native_transform.torch.utils import generate_layer_name
 
-if TYPE_CHECKING:
-    from michelangelo.lib.native_transform.torch.transform_spec import TransformSpec
-
-__all__ = ["TorchTransformModule", "get_transform_module"]
+__all__ = [
+    "TorchTransformModule",
+    "get_transform_module",
+    "load_transform_module_from_spec_dict",
+]
 
 
 class TorchTransformModule(torch.nn.Module):
@@ -152,3 +159,47 @@ def get_transform_module(
         else sorted(output_cols),
         layers=torch.nn.ModuleList(layers),
     )
+
+
+def load_transform_module_from_spec_dict(
+    spec_dict: dict[str, Any],
+    start_level: int = 0,
+    end_level: int | None = None,
+) -> TorchTransformModule:
+    """Reconstruct a ``TorchTransformModule`` from a ``TransformSpec.to_dict()`` dict.
+
+    Used as a Hydra ``_target_`` factory (see
+    :mod:`michelangelo.lib.shared.utils.model_fuser._private.fuse`) to
+    materialize a fitted native-transform module from its serialized spec at
+    model-load time. ``TorchTransformModule`` cannot be built directly from
+    ``to_dict()``'s output -- that dict has spec-DAG shape, not
+    ``TorchTransformModule.__init__``'s ``name``/``input_cols``/
+    ``output_cols``/``layers`` constructor shape.
+
+    Args:
+        spec_dict: A dict produced by ``TransformSpec.to_dict()``.
+        start_level: The first transform level to include (inclusive).
+        end_level: The last transform level to include (inclusive), or
+            ``None`` for the spec's maximum level.
+
+    Returns:
+        The materialized ``TorchTransformModule``.
+
+    Raises:
+        ValueError: If ``[start_level, end_level]`` contains no layers --
+            a factory used as a Hydra ``_target_`` must return a module, not
+            ``None``.
+    """
+    transform_spec = TransformSpec(raw_transform_specs={"transform_specs": []})
+    transform_spec.load_from_dict(spec_dict)
+    module = get_transform_module(transform_spec, start_level, end_level)
+    if module is None:
+        resolved_end_level = (
+            transform_spec.get_max_transform_level() if end_level is None else end_level
+        )
+        raise ValueError(
+            f"No transform layers found in levels [{start_level}, "
+            f"{resolved_end_level}]; load_transform_module_from_spec_dict "
+            "cannot materialize an empty TorchTransformModule."
+        )
+    return module

@@ -16,10 +16,13 @@ non-fused models get equivalent ONNX output quality.
 
 Building the Hydra reconstruction spec for a fused *native-transform* model's
 Python-backend package (:func:`~._private.fuse._build_tx_hydra_spec`)
-requires the native transform package, which has not yet been migrated to
-OSS. Until it lands, that one function raises ``NotImplementedError``; every
-other function in this module (TorchScript export, ONNX export, field-order
-recovery, sample-data merge) works standalone.
+dispatches on the transform's class: the real
+:class:`~michelangelo.lib.native_transform.torch.base_transform_module.TorchTransformModule`
+case reconstructs through
+:func:`~michelangelo.lib.native_transform.torch.base_transform_module.load_transform_module_from_spec_dict`,
+since its serialized hyperparameters are a spec-DAG dict, not constructor
+kwargs; any other transform class falls back to a generic
+``{"_target_": tx_model_class, **tx_hyperparameters}`` spec.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ from ._private.fuse import (
     _forward_param_order,
     _load_module_from_path,
     _schema_input_keys,
+    _schema_input_shapes,
 )
 from .fused_model import FusedModel
 
@@ -300,6 +304,7 @@ def fuse_models_to_python(
     tx_model_path: str,
     model_class: str,
     hyperparameters: dict[str, Any],
+    tx_model_class: str,
     tx_hyperparameters: dict[str, Any],
     dest_path: str,
     tx_model_schema: ModelSchema | None = None,
@@ -321,6 +326,7 @@ def fuse_models_to_python(
             ``nn.Module``).
         model_class: Dotted class name for the predictor.
         hyperparameters: Constructor kwargs for the predictor.
+        tx_model_class: Dotted class name for the transform.
         tx_hyperparameters: The transform's ``to_dict()`` output.
         dest_path: Local path where the combined state dict is saved.
         tx_model_schema: Native-transform model schema.
@@ -330,12 +336,6 @@ def fuse_models_to_python(
         A tuple ``(dest_path, fused_model_class, fused_hyperparameters)``:
         the saved state dict path, ``FusedModel``'s dotted class name, and
         the serve-time reconstruction spec.
-
-    Raises:
-        NotImplementedError: Building ``fused_hyperparameters["transform_module"]``
-            requires the native-transform package (see
-            :func:`~._private.fuse._build_tx_hydra_spec`), which is not yet
-            available in OSS.
     """
     hyperparameters = hyperparameters or {}
     tx_hyperparameters = tx_hyperparameters or {}
@@ -367,7 +367,7 @@ def fuse_models_to_python(
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     torch.save(combined_sd, dest_path)
 
-    tx_spec = _build_tx_hydra_spec(tx_hyperparameters)
+    tx_spec = _build_tx_hydra_spec(tx_model_class, tx_hyperparameters)
 
     fused_model_class = f"{FusedModel.__module__}.{FusedModel.__qualname__}"
     fused_hyperparameters = {
@@ -376,6 +376,7 @@ def fuse_models_to_python(
         "transform_input_keys": transform_input_keys,
         "predictor_input_keys": predictor_input_keys,
         "predictor_takes_dict": predictor_takes_dict,
+        "predictor_input_shapes": _schema_input_shapes(model_schema),
     }
 
     return dest_path, fused_model_class, fused_hyperparameters

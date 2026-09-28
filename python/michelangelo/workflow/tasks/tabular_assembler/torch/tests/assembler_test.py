@@ -19,6 +19,7 @@ from michelangelo.lib.model_manager.constants import StorageType
 from michelangelo.lib.model_manager.schema import DataType, ModelSchema, ModelSchemaItem
 from michelangelo.lib.model_manager.schema.feature_schema import FeatureSchema
 from michelangelo.lib.model_manager.schema.feature_schema_item import FeatureSchemaItem
+from michelangelo.lib.shared.utils.model_fuser import fused_model
 from michelangelo.workflow.schema.assembler import (
     TabularAssemblerConfig,
     TorchAssemblerConfig,
@@ -317,20 +318,34 @@ class TorchAssemblerTest(_LocalBackendTestCase):
                     prefixes,
                 )
 
-    def test_native_transform_raises_not_implemented_pending_native_transform(self):
-        """Real fusion now runs; native_transform support is still needed.
+    @patch(f"{_ASSEMBLER_MODULE}.TorchTritonPackager.create_model_package")
+    @patch(f"{_ASSEMBLER_MODULE}.TorchTritonPackager.create_raw_model_package")
+    def test_native_transform_fuses_successfully_end_to_end(
+        self, mock_create_raw, mock_create_model
+    ):
+        """Real (unmocked) fusion succeeds for the Python-backend raw package.
 
-        ``torch/assembler.py``'s native-transform branch resolves its
-        ``model_fuser.fuse`` import, so this no longer fails at the import
-        stub in ``_model_fuser_functions``. It reaches real fusion code and
-        still raises ``NotImplementedError`` -- now from
-        ``fuse_models_to_python``'s ``_build_tx_hydra_spec`` call, which is
-        gated on the native-transform package, which hasn't landed yet. Real
-        (non-garbage) model files are used here so the
-        ``NotImplementedError`` is unambiguously coming from that gate and
-        not an incidental file-format error.
+        ``torch/assembler.py``'s native-transform branch used to fail
+        deterministically at ``fuse_models_to_python``'s
+        ``_build_tx_hydra_spec`` call, which unconditionally raised
+        ``NotImplementedError``. Now that it dispatches (generic branch here,
+        since ``_E2ETxModule`` isn't ``TorchTransformModule``), real fusion
+        with real model files succeeds end to end. Uses the ``python``
+        backend so the deployable package reuses the fused raw ``.pt``
+        directly, rather than also separately tracing a TorchScript export
+        (a different code path, unrelated to this fix, whose predictor/
+        transform key naming isn't set up to align in this fixture). The
+        packager itself is mocked, as in every other test in this file --
+        this test's scope is real fusion, not real packaging.
         """
-        config = TabularAssemblerConfig()
+        mock_create_model.side_effect = _fake_create_package("deployable")
+        mock_create_raw.side_effect = _fake_create_package("raw")
+
+        config = TabularAssemblerConfig(
+            torch=TorchAssemblerConfig(
+                backend="python", include_import_prefixes=[__name__]
+            )
+        )
         raw_model = ModelArtifact(
             path=self._upload_real_module_source(_E2EPredictor()),
             metadata=ModelMetadata(
@@ -348,14 +363,20 @@ class TorchAssemblerTest(_LocalBackendTestCase):
             ),
         )
 
-        with self.assertRaises(NotImplementedError) as ctx:
-            torch_assembler(
-                config,
-                raw_model,
-                native_transform_model=native_tx,
-                storage_backend=self.storage_backend,
-            )
-        self.assertIn("native-transform", str(ctx.exception))
+        assembled = torch_assembler(
+            config,
+            raw_model,
+            native_transform_model=native_tx,
+            storage_backend=self.storage_backend,
+        )
+
+        mock_create_raw.assert_called_once()
+        self.assertEqual(
+            mock_create_raw.call_args.kwargs["model_class"],
+            f"{fused_model.FusedModel.__module__}.{fused_model.FusedModel.__qualname__}",
+        )
+        self.assertTrue(os.path.exists(assembled.deployable_model.path))
+        self.assertTrue(os.path.exists(assembled.raw_model.path))
 
 
 class FeaturePackageFusionTest(_LocalBackendTestCase):

@@ -119,6 +119,7 @@ def torch_assembler(
                     tx_model_path=tx_local_path,
                     model_class=model_class,
                     hyperparameters=hyperparameters,
+                    tx_model_class=tx_model_class,
                     tx_hyperparameters=tx_hyperparameters,
                     dest_path=raw_model_path,
                     tx_model_schema=tx_model_schema,

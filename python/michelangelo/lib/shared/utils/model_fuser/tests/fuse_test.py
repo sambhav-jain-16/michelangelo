@@ -1,8 +1,9 @@
 """Tests for ``model_fuser.fuse``.
 
-Tests are grouped into non-ONNX cases, ONNX export cases, and
-native-transform-gated cases (present but skipped until native-transform
-support is available).
+Tests are grouped into non-ONNX cases, ONNX export cases, and Python-backend
+(raw package) fusion cases, the latter covering both the generic
+``_target_`` dispatch branch and the real ``TorchTransformModule`` dispatch
+branch of ``_build_tx_hydra_spec``.
 
 ``fuse_input_schema``/``fuse_model_schema`` already have full coverage in
 ``fuse_schema_test.py`` and are not re-tested here.
@@ -26,6 +27,11 @@ import torch
 import torch.nn as nn
 
 from michelangelo.lib.model_manager.schema import DataType, ModelSchema, ModelSchemaItem
+from michelangelo.lib.native_transform.torch.base_transform_module import (
+    TorchTransformModule,
+    get_transform_module,
+)
+from michelangelo.lib.native_transform.torch.transform_spec import TransformSpec
 from michelangelo.lib.shared.utils.model_fuser import (
     fuse as fuse_module,
 )
@@ -50,6 +56,7 @@ from michelangelo.lib.shared.utils.model_fuser.fuse import (
     fuse_models_to_torchscript,
     get_predictor_output_field_order,
 )
+from michelangelo.uniflow.core.utils import import_attribute
 
 FusedModel = fused_model.FusedModel
 
@@ -74,6 +81,23 @@ class _TensorPredictor(nn.Module):
 
     def forward(self, out: torch.Tensor) -> torch.Tensor:
         return out.sum(dim=-1, keepdim=True)
+
+
+class _ScalarStackPredictor(nn.Module):
+    """Predictor stacking two scalar (batch,) columns via dim=1.
+
+    Like ``NativeTxRegressionModel`` -- the real fixture that motivated
+    ``FusedModel``'s ``predictor_input_shapes`` reshape. A real ``nn.Linear``
+    (not just a sum) means a wrong-rank stack fails loudly.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(2, 1)
+
+    def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        x = torch.stack([inputs["out"].float(), inputs["passthrough"].float()], dim=1)
+        return self.linear(x)
 
 
 class _DictPredictor(nn.Module):
@@ -455,11 +479,39 @@ class BuildFusedSampleInputTest(unittest.TestCase):
         expected_type = "cuda" if torch.cuda.is_available() else "cpu"
         self.assertTrue(all(t.device.type == expected_type for t in out.values()))
 
-    def test_zero_or_empty_shape_uses_minimum_one(self):
-        """Zero or empty shape uses minimum one."""
+    def test_zero_sized_dimension_uses_minimum_one(self):
+        """A declared dimension of size 0 is clamped to 1, not left empty."""
         schema = ModelSchema(
             input_schema=[
                 ModelSchemaItem(name="a", data_type=DataType.FLOAT, shape=[0])
+            ]
+        )
+        out = _build_fused_sample_input(schema, None)
+        self.assertEqual(out["a"].shape, (1, 1))
+
+    def test_empty_shape_list_produces_true_scalar_tensor(self):
+        """shape=[] (ColumnConfig's documented scalar convention) has no feature dim.
+
+        Unlike ``shape=None`` (genuinely unspecified, defaults to a single
+        dimension of size 1), an explicit empty list means "no feature
+        dimension at all" -- e.g. ``tabular_trainer``'s ``ColumnConfig``
+        defaults to ``shape=[]`` for "the common tabular case". The sample
+        tensor must be ``[batch_size]``, matching a predictor whose
+        ``forward()`` stacks per-column tensors via
+        ``torch.stack([...], dim=1)`` expecting each column as a plain
+        ``(batch,)`` tensor.
+        """
+        schema = ModelSchema(
+            input_schema=[ModelSchemaItem(name="a", data_type=DataType.FLOAT, shape=[])]
+        )
+        out = _build_fused_sample_input(schema, None, batch_size=4)
+        self.assertEqual(out["a"].shape, (4,))
+
+    def test_none_shape_defaults_to_single_dimension(self):
+        """shape=None (genuinely unspecified) still defaults to size 1."""
+        schema = ModelSchema(
+            input_schema=[
+                ModelSchemaItem(name="a", data_type=DataType.FLOAT, shape=None)
             ]
         )
         out = _build_fused_sample_input(schema, None)
@@ -1201,46 +1253,411 @@ class FuseModelsToOnnxTest(unittest.TestCase):
 
 
 # ===========================================================================
-# Native-transform-gated cases
+# Python-backend (raw package) fusion cases
 # ===========================================================================
 #
-# fuse_models_to_python always raises NotImplementedError for its raw
-# package until the native-transform package (TransformSpec,
-# TorchTransformModule) is migrated -- see _build_tx_hydra_spec's docstring.
-# FuseModelsToPythonNotImplementedTest below locks in that current behavior.
-# Once native-transform lands, add real behavioral coverage for the raw
-# package here.
+# fuse_models_to_python reconstructs fused_hyperparameters["transform_module"]
+# via _build_tx_hydra_spec, which dispatches on tx_model_class: the real
+# TorchTransformModule case reconstructs through
+# load_transform_module_from_spec_dict; any other class falls back to a
+# generic {"_target_": tx_model_class, **tx_hyperparameters} spec.
 
 
-class FuseModelsToPythonNotImplementedTest(unittest.TestCase):
-    """Documents today's actual (gated) behavior of ``fuse_models_to_python``.
+class _TorchTransformModuleSubclass(TorchTransformModule):
+    """A ``TorchTransformModule`` subclass, for dispatch-by-subclass coverage."""
 
-    Unlike the placeholder class above (which mirrors the future suite and
-    stays skipped), this test runs today: it locks in that calling
-    ``fuse_models_to_python`` raises a clear, actionable ``NotImplementedError``
-    rather than failing confusingly or silently returning bad data.
-    """
 
-    def test_raises_notimplementederror_pointing_to_native_transform(self):
-        """Raises notimplementederror pointing to native transform."""
+class BuildTxHydraSpecDispatchTest(unittest.TestCase):
+    """``_build_tx_hydra_spec`` dispatches structurally, not by string equality."""
+
+    def test_exact_class_dispatches_to_factory(self):
+        """The exact TorchTransformModule dotted path dispatches to the factory."""
+        tx_model_class = _class_path(TorchTransformModule)
+        spec = private_fuse_module._build_tx_hydra_spec(tx_model_class, {"k": "v"})
+        self.assertEqual(
+            spec,
+            {
+                "_target_": (
+                    "michelangelo.lib.native_transform.torch."
+                    "base_transform_module.load_transform_module_from_spec_dict"
+                ),
+                "spec_dict": {"k": "v"},
+            },
+        )
+
+    def test_subclass_also_dispatches_to_factory(self):
+        """A TorchTransformModule subclass dispatches like the base class.
+
+        Guards against reverting to plain string equality, which would
+        silently route a subclass through the generic branch and build a
+        reconstruction spec from its constructor kwargs -- wrong for any
+        TorchTransformModule descendant, whose serialized hyperparameters
+        are spec-DAG shaped, not constructor kwargs.
+        """
+        tx_model_class = _class_path(_TorchTransformModuleSubclass)
+        spec = private_fuse_module._build_tx_hydra_spec(tx_model_class, {"k": "v"})
+        self.assertEqual(
+            spec,
+            {
+                "_target_": (
+                    "michelangelo.lib.native_transform.torch."
+                    "base_transform_module.load_transform_module_from_spec_dict"
+                ),
+                "spec_dict": {"k": "v"},
+            },
+        )
+
+    def test_unrelated_class_falls_back_to_generic(self):
+        """A class unrelated to TorchTransformModule uses the generic spec."""
+        spec = private_fuse_module._build_tx_hydra_spec(
+            _class_path(_DictTransform), {"k": "v"}
+        )
+        self.assertEqual(spec, {"_target_": _class_path(_DictTransform), "k": "v"})
+
+    def test_unresolvable_class_falls_back_to_generic(self):
+        """A dotted path that can't be imported falls back to the generic spec."""
+        spec = private_fuse_module._build_tx_hydra_spec(
+            "not.a.real.module.Class", {"k": "v"}
+        )
+        self.assertEqual(spec, {"_target_": "not.a.real.module.Class", "k": "v"})
+
+
+class FuseModelsToPythonTest(unittest.TestCase):
+    """Real behavioral coverage for ``fuse_models_to_python``'s raw-package fusion."""
+
+    def test_generic_dispatch_round_trips_and_matches_forward(self):
+        """A non-TorchTransformModule tx_model_class falls back to flat _target_."""
         with tempfile.TemporaryDirectory() as d:
             tx_path = os.path.join(d, "tx.pt")
             pred_path = os.path.join(d, "pred.pt")
             dest_path = os.path.join(d, "fused.pt")
+            tx_hyperparameters = {"d_model": 64, "seq_len": 10}
+            original_tx = _TransformerDictTransform(**tx_hyperparameters)
+            original_tx.eval()
+            # fuse_models_to_python always loads the tx file as a full
+            # nn.Module (weights_only=False) and calls .state_dict() on it --
+            # unlike the predictor path, it doesn't auto-detect a bare
+            # state_dict.
+            torch.save(original_tx, tx_path)
+            torch.save(
+                _TransformerPredictor(
+                    d_model=64, n_heads=4, n_layers=2, d_ff=128
+                ).state_dict(),
+                pred_path,
+            )
+            tx_schema = ModelSchema(
+                input_schema=[
+                    ModelSchemaItem(name="feat", data_type=DataType.FLOAT, shape=[1])
+                ],
+                output_schema=[
+                    ModelSchemaItem(
+                        name="emb", data_type=DataType.FLOAT, shape=[10, 64]
+                    )
+                ],
+            )
+            pred_schema = ModelSchema(
+                input_schema=[
+                    ModelSchemaItem(
+                        name="emb", data_type=DataType.FLOAT, shape=[10, 64]
+                    )
+                ],
+                output_schema=[
+                    ModelSchemaItem(name="output", data_type=DataType.FLOAT, shape=[1])
+                ],
+            )
+
+            result_path, _, fused_hyperparameters = fuse_models_to_python(
+                torch_model_path=pred_path,
+                tx_model_path=tx_path,
+                model_class=_class_path(_TransformerPredictor),
+                hyperparameters={
+                    "d_model": 64,
+                    "n_heads": 4,
+                    "n_layers": 2,
+                    "d_ff": 128,
+                },
+                tx_model_class=_class_path(_TransformerDictTransform),
+                tx_hyperparameters=tx_hyperparameters,
+                dest_path=dest_path,
+                tx_model_schema=tx_schema,
+                model_schema=pred_schema,
+            )
+
+            self.assertEqual(result_path, dest_path)
+            self.assertEqual(
+                fused_hyperparameters["transform_module"],
+                {
+                    "_target_": _class_path(_TransformerDictTransform),
+                    **tx_hyperparameters,
+                },
+            )
+            self.assertEqual(
+                fused_hyperparameters["predictor_input_shapes"], {"emb": [10, 64]}
+            )
+
+            # Reconstruct exactly as load-time `instantiate` would, and check
+            # numerical equivalence against the originally-fitted transform.
+            spec = fused_hyperparameters["transform_module"]
+            target = spec["_target_"]
+            kwargs = {k: v for k, v in spec.items() if k != "_target_"}
+            reconstructed = import_attribute(target)(**kwargs)
+            combined_sd = torch.load(dest_path, map_location="cpu", weights_only=True)
+            tx_sd = {
+                k[len("transform_module.") :]: v
+                for k, v in combined_sd.items()
+                if k.startswith("transform_module.")
+            }
+            reconstructed.load_state_dict(tx_sd)
+            reconstructed.eval()
+
+            sample = {"feat": torch.randn(2, 1, dtype=torch.float32)}
+            with torch.no_grad():
+                expected_out = original_tx(sample)["emb"]
+                actual_out = reconstructed(sample)["emb"]
+            torch.testing.assert_close(actual_out, expected_out)
+
+    def test_torch_transform_module_dispatch_matches_fitted_forward(self):
+        """TorchTransformModule tx_model_class dispatches to the spec-dict factory."""
+        with tempfile.TemporaryDirectory() as d:
+            tx_path = os.path.join(d, "tx.pt")
+            pred_path = os.path.join(d, "pred.pt")
+            dest_path = os.path.join(d, "fused.pt")
+
+            spec = TransformSpec(
+                raw_transform_specs={
+                    "transform_specs": [
+                        {
+                            "transform_name": "Cast",
+                            "input_cols": ["a"],
+                            "output_cols": ["a_cast"],
+                            "dtype": "float32",
+                        },
+                        {
+                            "transform_name": "Scale",
+                            "input_cols": ["a_cast"],
+                            # Named "out" to match _TensorPredictor.forward's
+                            # sole parameter -- the predictor's forward()
+                            # signature must line up with the schema's input
+                            # names for a positional (non-dict) predictor.
+                            "output_cols": ["out"],
+                            "factor": 2.0,
+                        },
+                    ]
+                }
+            )
+            fitted_tx = get_transform_module(spec, start_level=0)
+            fitted_tx.eval()
+            # A full module, not a bare state_dict: fuse_models_to_python
+            # always torch.load(..., weights_only=False)s the tx file and
+            # calls .state_dict() on the result, matching how
+            # tabular_native_transform stores its fitted transform module.
+            torch.save(fitted_tx, tx_path)
             torch.save(_TensorPredictor().state_dict(), pred_path)
-            torch.save(_DictTransform(), tx_path)
-            with self.assertRaises(NotImplementedError) as ctx:
-                fuse_models_to_python(
-                    torch_model_path=pred_path,
-                    tx_model_path=tx_path,
-                    model_class=_class_path(_TensorPredictor),
-                    hyperparameters={},
-                    tx_hyperparameters={},
-                    dest_path=dest_path,
-                    tx_model_schema=None,
-                    model_schema=None,
+
+            tx_hyperparameters = spec.to_dict()
+            tx_schema = ModelSchema(
+                input_schema=[
+                    ModelSchemaItem(name="a", data_type=DataType.FLOAT, shape=[1])
+                ],
+                output_schema=[
+                    ModelSchemaItem(name="out", data_type=DataType.FLOAT, shape=[1])
+                ],
+            )
+            pred_schema = ModelSchema(
+                input_schema=[
+                    ModelSchemaItem(name="out", data_type=DataType.FLOAT, shape=[1])
+                ],
+                output_schema=[
+                    ModelSchemaItem(name="output", data_type=DataType.FLOAT, shape=[1])
+                ],
+            )
+            tx_model_class = (
+                "michelangelo.lib.native_transform.torch.base_transform_module."
+                "TorchTransformModule"
+            )
+
+            _, _, fused_hyperparameters = fuse_models_to_python(
+                torch_model_path=pred_path,
+                tx_model_path=tx_path,
+                model_class=_class_path(_TensorPredictor),
+                hyperparameters={},
+                tx_model_class=tx_model_class,
+                tx_hyperparameters=tx_hyperparameters,
+                dest_path=dest_path,
+                tx_model_schema=tx_schema,
+                model_schema=pred_schema,
+            )
+
+            self.assertEqual(
+                fused_hyperparameters["transform_module"],
+                {
+                    "_target_": (
+                        "michelangelo.lib.native_transform.torch."
+                        "base_transform_module.load_transform_module_from_spec_dict"
+                    ),
+                    "spec_dict": tx_hyperparameters,
+                },
+            )
+
+            spec_out = fused_hyperparameters["transform_module"]
+            factory = import_attribute(spec_out["_target_"])
+            reconstructed = factory(spec_dict=spec_out["spec_dict"])
+            combined_sd = torch.load(dest_path, map_location="cpu", weights_only=True)
+            tx_sd = {
+                k[len("transform_module.") :]: v
+                for k, v in combined_sd.items()
+                if k.startswith("transform_module.")
+            }
+            reconstructed.load_state_dict(tx_sd)
+            reconstructed.eval()
+
+            sample = {"a": torch.tensor([1, 2, 3], dtype=torch.int32)}
+            with torch.no_grad():
+                expected_out = fitted_tx(sample)["out"]
+                actual_out = reconstructed(sample)["out"]
+            torch.testing.assert_close(actual_out, expected_out)
+
+    def test_full_reconstruction_reshapes_native_transform_output_for_predictor(self):
+        """End-to-end: schema -> fuse_models_to_python -> real FusedModel -> forward().
+
+        Reproduces PR #61's actual production bug and proves fixes #2-#4
+        work together, not just in isolation: ``tx_schema`` declares its
+        output using ``tabular_native_transform``'s scalar convention
+        (``shape=[1]``), while ``pred_schema`` declares the *same* logical
+        feature using ``tabular_trainer``'s ``ColumnConfig`` convention
+        (``shape=[]``) -- exactly the mismatch that crashes
+        ``_ScalarStackPredictor``'s ``nn.Linear`` without the reshape fix.
+        Unlike the other dispatch tests above (which reconstruct only the
+        transform module in isolation), this test reconstructs the *entire*
+        ``FusedModel`` from ``fuse_models_to_python``'s real return values
+        and calls ``.forward()`` on it, the way the packager's own
+        load-time ``instantiate()`` would.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tx_path = os.path.join(d, "tx.pt")
+            pred_path = os.path.join(d, "pred.pt")
+            dest_path = os.path.join(d, "fused.pt")
+
+            spec = TransformSpec(
+                raw_transform_specs={
+                    "transform_specs": [
+                        {
+                            "transform_name": "Scale",
+                            "input_cols": ["a"],
+                            "output_cols": ["out"],
+                            "factor": 2.0,
+                        },
+                    ]
+                }
+            )
+            fitted_tx = get_transform_module(spec, start_level=0)
+            fitted_tx.eval()
+            torch.save(fitted_tx, tx_path)
+
+            predictor = _ScalarStackPredictor()
+            predictor.eval()
+            torch.save(predictor.state_dict(), pred_path)
+
+            tx_schema = ModelSchema(
+                input_schema=[
+                    ModelSchemaItem(name="a", data_type=DataType.FLOAT, shape=[1])
+                ],
+                # native_transform's own convention: scalar output = [1].
+                output_schema=[
+                    ModelSchemaItem(name="out", data_type=DataType.FLOAT, shape=[1])
+                ],
+            )
+            pred_schema = ModelSchema(
+                # tabular_trainer's ColumnConfig convention: scalar = [].
+                # "out" here is the *same logical feature* tx_schema just
+                # declared as [1] -- the deliberate mismatch under test.
+                input_schema=[
+                    ModelSchemaItem(name="out", data_type=DataType.FLOAT, shape=[]),
+                    ModelSchemaItem(
+                        name="passthrough", data_type=DataType.FLOAT, shape=[]
+                    ),
+                ],
+                output_schema=[
+                    ModelSchemaItem(name="output", data_type=DataType.FLOAT, shape=[1])
+                ],
+            )
+            tx_model_class = (
+                "michelangelo.lib.native_transform.torch.base_transform_module."
+                "TorchTransformModule"
+            )
+
+            _, fused_model_class, fused_hyperparameters = fuse_models_to_python(
+                torch_model_path=pred_path,
+                tx_model_path=tx_path,
+                model_class=_class_path(_ScalarStackPredictor),
+                hyperparameters={},
+                tx_model_class=tx_model_class,
+                tx_hyperparameters=spec.to_dict(),
+                dest_path=dest_path,
+                tx_model_schema=tx_schema,
+                model_schema=pred_schema,
+            )
+
+            self.assertEqual(
+                fused_hyperparameters["predictor_input_shapes"],
+                {"out": [], "passthrough": []},
+            )
+
+            # Reconstruct the *whole* FusedModel exactly as load-time
+            # `instantiate()` would (resolve each nested _target_ spec, then
+            # build FusedModel itself from the remaining plain kwargs).
+            def _instantiate(spec: dict) -> nn.Module:
+                target = spec["_target_"]
+                kwargs = {k: v for k, v in spec.items() if k != "_target_"}
+                return import_attribute(target)(**kwargs)
+
+            transform_module = _instantiate(fused_hyperparameters["transform_module"])
+            predictor_module = _instantiate(fused_hyperparameters["predictor_module"])
+
+            combined_sd = torch.load(dest_path, map_location="cpu", weights_only=True)
+            transform_module.load_state_dict(
+                {
+                    k[len("transform_module.") :]: v
+                    for k, v in combined_sd.items()
+                    if k.startswith("transform_module.")
+                }
+            )
+            predictor_module.load_state_dict(
+                {
+                    k[len("predictor_module.") :]: v
+                    for k, v in combined_sd.items()
+                    if k.startswith("predictor_module.")
+                }
+            )
+
+            fused = FusedModel(
+                transform_module=transform_module,
+                predictor_module=predictor_module,
+                transform_input_keys=fused_hyperparameters["transform_input_keys"],
+                predictor_input_keys=fused_hyperparameters["predictor_input_keys"],
+                predictor_takes_dict=fused_hyperparameters["predictor_takes_dict"],
+                predictor_input_shapes=fused_hyperparameters["predictor_input_shapes"],
+            )
+            fused.eval()
+
+            # "a" is shaped (batch, 1), matching tx_schema's declared
+            # shape=[1] -- the real runtime shape native_transform's own
+            # elementwise (shape-preserving) layers actually produce for a
+            # schema-declared scalar, not a bare (batch,) convenience shape.
+            sample = {
+                "a": torch.tensor([[3.0]]),
+                "passthrough": torch.tensor([5.0]),
+            }
+            with torch.no_grad():
+                # Without the reshape fix, "out" (produced by the transform
+                # as shape (1, 1)) stacked with "passthrough" (shape (1,))
+                # would either raise inside nn.Linear or, if it happened not
+                # to, would not match this expected value.
+                actual = fused(sample)
+                expected = predictor_module(
+                    {"out": torch.tensor([6.0]), "passthrough": torch.tensor([5.0])}
                 )
-            self.assertIn("native-transform", str(ctx.exception))
+            torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

@@ -160,5 +160,134 @@ class FusedModelMergeTest(unittest.TestCase):
         self.assertEqual(out.item(), 1.0 + 2.0)
 
 
+class FusedModelPredictorInputShapesTest(unittest.TestCase):
+    """``predictor_input_shapes`` reshapes values to the predictor's own schema.
+
+    Reproduces the real shape-convention mismatch between
+    ``tabular_native_transform`` (scalar columns declared as shape ``[1]``)
+    and ``tabular_trainer``'s ``ColumnConfig`` (scalar columns declared as
+    shape ``[]``): a transform producing ``(batch, 1)``-shaped values for a
+    feature the predictor's own schema declares as a true scalar (``[]``,
+    i.e. a plain ``(batch,)`` tensor) must not reach the predictor unreshaped.
+    """
+
+    def test_unreshaped_transform_output_produces_wrong_rank_for_stacking_predictor(
+        self,
+    ):
+        """Without predictor_input_shapes, a (batch, 1) value breaks a Linear stack.
+
+        This is the actual failure this feature fixes: a predictor with a
+        real ``nn.Linear`` stacking scalar columns raises when handed
+        unreshaped ``(batch, 1)`` values instead of ``(batch,)``.
+        """
+
+        class _ScalarOutTransform(nn.Module):
+            def forward(
+                self, inputs: dict[str, torch.Tensor]
+            ) -> dict[str, torch.Tensor]:
+                return {"scaled": inputs["a"] * 2.0}
+
+        class _LinearStackPredictor(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = nn.Linear(2, 1)
+
+            def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                x = torch.stack(
+                    [inputs["scaled"].float(), inputs["other"].float()], dim=1
+                )
+                return self.linear(x)
+
+        fused_without_shapes = FusedModel(
+            transform_module=_ScalarOutTransform(),
+            predictor_module=_LinearStackPredictor(),
+            transform_input_keys=["a"],
+            predictor_input_keys=["scaled", "other"],
+            predictor_takes_dict=True,
+        )
+        fused_without_shapes.eval()
+        inputs = {
+            "a": torch.tensor([[3.0]], dtype=torch.float32),
+            "other": torch.tensor([[5.0]], dtype=torch.float32),
+        }
+        with torch.no_grad(), self.assertRaises(RuntimeError):
+            fused_without_shapes(inputs)
+
+        fused_with_shapes = FusedModel(
+            transform_module=_ScalarOutTransform(),
+            predictor_module=_LinearStackPredictor(),
+            transform_input_keys=["a"],
+            predictor_input_keys=["scaled", "other"],
+            predictor_takes_dict=True,
+            predictor_input_shapes={"scaled": [], "other": []},
+        )
+        fused_with_shapes.eval()
+        with torch.no_grad():
+            out = fused_with_shapes(inputs)
+        self.assertEqual(out.shape, (1, 1))
+
+    def test_feature_without_declared_shape_passes_through_unreshaped(self):
+        """A key absent from predictor_input_shapes is left as-is."""
+
+        class _PassthroughTransform(nn.Module):
+            def forward(
+                self, inputs: dict[str, torch.Tensor]
+            ) -> dict[str, torch.Tensor]:
+                return {}
+
+        class _ShapeCapturePredictor(nn.Module):
+            def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return inputs["x"]
+
+        fused = FusedModel(
+            transform_module=_PassthroughTransform(),
+            predictor_module=_ShapeCapturePredictor(),
+            transform_input_keys=[],
+            predictor_input_keys=["x"],
+            predictor_takes_dict=True,
+            predictor_input_shapes={},
+        )
+        fused.eval()
+        with torch.no_grad():
+            out = fused({"x": torch.tensor([[1.0, 2.0]], dtype=torch.float32)})
+        self.assertEqual(out.shape, (1, 2))
+
+    def test_rejects_reshape_that_is_not_a_pure_squeeze_unsqueeze(self):
+        """A declared shape whose non-1 dims differ from the actual value raises.
+
+        Guards against silently reshaping into wrong numbers: a plain
+        ``value.reshape(...)`` would happily "succeed" on any target shape
+        with the same total element count -- including one that transposes
+        or scrambles genuinely multi-dimensional data -- as long as the
+        element count matches. Only a pure squeeze/unsqueeze of size-1
+        dimensions should be allowed.
+        """
+
+        class _PassthroughTransform(nn.Module):
+            def forward(
+                self, inputs: dict[str, torch.Tensor]
+            ) -> dict[str, torch.Tensor]:
+                return {}
+
+        class _AcceptsAnythingPredictor(nn.Module):
+            def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return inputs["x"]
+
+        fused = FusedModel(
+            transform_module=_PassthroughTransform(),
+            predictor_module=_AcceptsAnythingPredictor(),
+            transform_input_keys=[],
+            predictor_input_keys=["x"],
+            predictor_takes_dict=True,
+            # Declared shape [3, 2] has the same element count as the
+            # actual value's [2, 3] but reorders real (non-1) dimensions --
+            # not a safe squeeze/unsqueeze.
+            predictor_input_shapes={"x": [3, 2]},
+        )
+        fused.eval()
+        with torch.no_grad(), self.assertRaisesRegex(ValueError, "Refusing to reshape"):
+            fused({"x": torch.zeros(1, 2, 3)})
+
+
 if __name__ == "__main__":
     unittest.main()
